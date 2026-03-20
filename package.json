@@ -1,0 +1,21 @@
+{
+  "name": "ecommerce-platform",
+  "version": "1.0.0",
+  "description": "Distributed E-commerce Platform with Microservices",
+  "private": true,
+  "scripts": {
+    "install:all": "npm install && for dir in services/*/; do (cd \"$dir\" && npm install); done && (cd api-gateway && npm install) && (cd analytics && npm install)",
+    "start:local": "docker-compose -f docker-compose.local.yml up",
+    "start:local:build": "docker-compose -f docker-compose.local.yml up --build",
+    "stop:local": "docker-compose -f docker-compose.local.yml down",
+    "logs": "docker-compose -f docker-compose.local.yml logs -f"
+  },
+  "keywords": [
+    "microservices",
+    "ecommerce",
+    "nodejs",
+    "kubernetes"
+  ],
+  "author": "",
+  "license": "ISC"
+}
