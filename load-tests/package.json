@@ -1,0 +1,11 @@
+{
+  "name": "load-tests",
+  "version": "1.0.0",
+  "description": "Load testing for e-commerce platform",
+  "scripts": {
+    "test": "artillery run load-test.yml"
+  },
+  "dependencies": {
+    "artillery": "^2.0.3"
+  }
+}
