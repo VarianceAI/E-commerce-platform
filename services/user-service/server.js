@@ -1,6 +1,6 @@
 const express = require('express');
 const mysql = require('mysql2/promise');
-const bcrypt = require('bcrypt');
+const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 require('dotenv').config();
@@ -55,26 +55,49 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'user-service' });
 });
 
-// Register user
+// Register user (customer or business)
 app.post('/register', async (req, res) => {
   try {
-    const { email, password, first_name, last_name } = req.body;
+    const { email, password, first_name, last_name, user_type, business_name } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password required' });
     }
 
+    const type = user_type || 'customer';
+    if (!['customer', 'business'].includes(type)) {
+      return res.status(400).json({ error: 'Invalid user_type' });
+    }
+
     const hashedPassword = await bcrypt.hash(password, 10);
     const connection = await pool.getConnection();
 
-    await connection.execute(
-      'INSERT INTO users (email, password_hash, first_name, last_name) VALUES (?, ?, ?, ?)',
-      [email, hashedPassword, first_name || null, last_name || null]
-    );
+    await connection.beginTransaction();
 
-    connection.release();
+    try {
+      // Insert user
+      const [userResult] = await connection.execute(
+        'INSERT INTO users (email, password_hash, first_name, last_name, user_type) VALUES (?, ?, ?, ?, ?)',
+        [email, hashedPassword, first_name || null, last_name || null, type]
+      );
 
-    res.status(201).json({ message: 'User registered successfully' });
+      // If business user, create business profile
+      if (type === 'business' && business_name) {
+        await connection.execute(
+          'INSERT INTO business_profiles (user_id, business_name) VALUES (?, ?)',
+          [userResult.insertId, business_name]
+        );
+      }
+
+      await connection.commit();
+      connection.release();
+
+      res.status(201).json({ message: 'User registered successfully', user_type: type });
+    } catch (innerErr) {
+      await connection.rollback();
+      connection.release();
+      throw innerErr;
+    }
   } catch (err) {
     if (err.code === 'ER_DUP_ENTRY') {
       return res.status(409).json({ error: 'Email already exists' });
@@ -109,12 +132,20 @@ app.post('/login', async (req, res) => {
     }
 
     const token = jwt.sign(
-      { id: user.id, email: user.email },
+      { id: user.id, email: user.email, user_type: user.user_type },
       process.env.JWT_SECRET || 'secret',
       { expiresIn: '24h' }
     );
 
-    res.json({ token, user: { id: user.id, email: user.email, name: user.first_name } });
+    res.json({ 
+      token, 
+      user: { 
+        id: user.id, 
+        email: user.email, 
+        name: user.first_name,
+        user_type: user.user_type 
+      } 
+    });
   } catch (err) {
     console.error('Login error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -173,6 +204,72 @@ app.get('/:id', async (req, res) => {
     res.json(users[0]);
   } catch (err) {
     console.error('Get user error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get business profile
+app.get('/business/:userId', async (req, res) => {
+  try {
+    const connection = await pool.getConnection();
+    const [profiles] = await connection.execute(
+      'SELECT * FROM business_profiles WHERE user_id = ?',
+      [req.params.userId]
+    );
+    connection.release();
+
+    if (profiles.length === 0) {
+      return res.status(404).json({ error: 'Business profile not found' });
+    }
+
+    res.json(profiles[0]);
+  } catch (err) {
+    console.error('Get business profile error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update business profile
+app.put('/business/profile', verifyToken, async (req, res) => {
+  try {
+    if (req.user.user_type !== 'business') {
+      return res.status(403).json({ error: 'Only business users can update business profile' });
+    }
+
+    const { business_name, business_type, description, website } = req.body;
+    const connection = await pool.getConnection();
+
+    await connection.execute(
+      'UPDATE business_profiles SET business_name = ?, business_type = ?, description = ?, website = ? WHERE user_id = ?',
+      [business_name, business_type, description, website, req.user.id]
+    );
+
+    connection.release();
+
+    res.json({ message: 'Business profile updated successfully' });
+  } catch (err) {
+    console.error('Update business profile error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get my business profile (authenticated)
+app.get('/business/profile', verifyToken, async (req, res) => {
+  try {
+    const connection = await pool.getConnection();
+    const [profiles] = await connection.execute(
+      'SELECT bp.*, u.email FROM business_profiles bp JOIN users u ON bp.user_id = u.id WHERE bp.user_id = ?',
+      [req.user.id]
+    );
+    connection.release();
+
+    if (profiles.length === 0) {
+      return res.status(404).json({ error: 'Business profile not found' });
+    }
+
+    res.json(profiles[0]);
+  } catch (err) {
+    console.error('Get business profile error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

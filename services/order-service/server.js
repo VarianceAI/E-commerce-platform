@@ -3,11 +3,32 @@ const mysql = require('mysql2/promise');
 const axios = require('axios');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
+const { Kafka } = require('kafkajs');
 require('dotenv').config();
 
 const app = express();
 app.use(express.json());
 app.use(cors());
+
+// Kafka setup
+const kafka = new Kafka({
+  clientId: 'order-service',
+  brokers: [process.env.KAFKA_BROKERS || 'localhost:9092']
+});
+const producer = kafka.producer();
+
+let kafkaReady = false;
+
+async function initializeKafka() {
+  try {
+    await producer.connect();
+    kafkaReady = true;
+    console.log('✓ Kafka connected');
+  } catch (err) {
+    console.error('✗ Kafka connection failed, retrying in 5s:', err.message);
+    setTimeout(initializeKafka, 5000);
+  }
+}
 
 let pool;
 
@@ -32,6 +53,10 @@ async function initializePool() {
     setTimeout(initializePool, 5000);
   }
 }
+
+// Initialize services (don't crash if Kafka isn't ready yet)
+initializePool();
+initializeKafka();
 
 // Health check
 app.get('/health', (req, res) => {
@@ -66,15 +91,26 @@ app.post('/', async (req, res) => {
     }
 
     // Emit event to outbox for eventual consistency
+    const eventPayload = { orderId, userId: user_id, items, totalAmount: total_amount };
     await connection.execute(
       'INSERT INTO events_outbox (aggregate_id, aggregate_type, event_type, payload) VALUES (?, ?, ?, ?)',
       [
         orderId,
         'Order',
         'OrderCreated',
-        JSON.stringify({ orderId, userId: user_id, items, totalAmount: total_amount }),
+        JSON.stringify(eventPayload),
       ]
     );
+
+    // Publish to Kafka (best-effort — outbox ensures eventual delivery)
+    if (kafkaReady) {
+      await producer.send({
+        topic: 'order-events',
+        messages: [
+          { key: orderId.toString(), value: JSON.stringify({ type: 'OrderCreated', ...eventPayload }) },
+        ],
+      });
+    }
 
     connection.release();
 
@@ -134,15 +170,26 @@ app.patch('/:order_id/status', async (req, res) => {
 
     await connection.execute('UPDATE orders SET status = ? WHERE id = ?', [status, req.params.order_id]);
 
+    const eventPayload = { orderId: req.params.order_id, newStatus: status };
     await connection.execute(
       'INSERT INTO events_outbox (aggregate_id, aggregate_type, event_type, payload) VALUES (?, ?, ?, ?)',
       [
         req.params.order_id,
         'Order',
         'OrderStatusChanged',
-        JSON.stringify({ orderId: req.params.order_id, newStatus: status }),
+        JSON.stringify(eventPayload),
       ]
     );
+
+    // Publish to Kafka (best-effort)
+    if (kafkaReady) {
+      await producer.send({
+        topic: 'order-events',
+        messages: [
+          { key: req.params.order_id.toString(), value: JSON.stringify({ type: 'OrderStatusChanged', ...eventPayload }) },
+        ],
+      });
+    }
 
     connection.release();
 
@@ -155,7 +202,6 @@ app.patch('/:order_id/status', async (req, res) => {
 
 const PORT = process.env.PORT || 3003;
 
-app.listen(PORT, async () => {
-  await initializePool();
+app.listen(PORT, () => {
   console.log(`Order Service running on port ${PORT}`);
 });

@@ -1,0 +1,93 @@
+{
+  "config": {
+    "target": "http://localhost:80",
+    "phases": [
+      {
+        "duration": 60,
+        "arrivalRate": 10,
+        "name": "Warm up"
+      },
+      {
+        "duration": 300,
+        "arrivalRate": 50,
+        "name": "Load test - 500 orders/min"
+      }
+    ],
+    "defaults": {
+      "headers": {
+        "Content-Type": "application/json"
+      }
+    }
+  },
+  "scenarios": [
+    {
+      "name": "User registration and order creation",
+      "weight": 70,
+      "flow": [
+        {
+          "post": {
+            "url": "/api/users/register",
+            "json": {
+              "email": "user{{ $randomInt }}@example.com",
+              "password": "password123",
+              "name": "Test User {{ $randomInt }}"
+            },
+            "capture": {
+              "json": "$.user.id",
+              "as": "userId"
+            }
+          }
+        },
+        {
+          "post": {
+            "url": "/api/users/login",
+            "json": {
+              "email": "user{{ $randomInt }}@example.com",
+            "password": "password123"
+            },
+            "capture": {
+              "json": "$.token",
+              "as": "token"
+            }
+          }
+        },
+        {
+          "get": {
+            "url": "/api/products?page=1&limit=10",
+            "capture": {
+              "json": "$.products[0].id",
+              "as": "productId"
+            }
+          }
+        },
+        {
+          "post": {
+            "url": "/api/orders",
+            "headers": {
+              "Authorization": "Bearer {{ token }}"
+            },
+            "json": {
+              "items": [
+                {
+                  "productId": "{{ productId }}",
+                  "quantity": 2
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Product search",
+      "weight": 30,
+      "flow": [
+        {
+          "get": {
+            "url": "/api/products/search?q=laptop&page=1&limit=20"
+          }
+        }
+      ]
+    }
+  ]
+}

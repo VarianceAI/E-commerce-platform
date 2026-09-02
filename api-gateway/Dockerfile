@@ -1,12 +1,8 @@
-FROM node:18-alpine
+FROM nginx:alpine
 
-WORKDIR /app
-
-COPY package.json ./
-RUN npm install
-
-COPY . .
+COPY nginx.conf /etc/nginx/nginx.conf
+COPY dashboard /usr/share/nginx/html/dashboard
 
 EXPOSE 8000
 
-CMD ["node", "server.js"]
+CMD ["nginx", "-g", "daemon off;"]

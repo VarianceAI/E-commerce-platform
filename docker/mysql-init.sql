@@ -7,23 +7,46 @@ CREATE TABLE IF NOT EXISTS users (
   last_name VARCHAR(100),
   phone_number VARCHAR(20),
   address TEXT,
+  user_type ENUM('customer', 'business') DEFAULT 'customer',
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  INDEX idx_email (email)
+  INDEX idx_email (email),
+  INDEX idx_user_type (user_type)
+);
+
+-- Create business_profiles table
+CREATE TABLE IF NOT EXISTS business_profiles (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  user_id INT NOT NULL UNIQUE,
+  business_name VARCHAR(255) NOT NULL,
+  business_type VARCHAR(100),
+  tax_id VARCHAR(50),
+  description TEXT,
+  logo_url VARCHAR(500),
+  website VARCHAR(255),
+  verified BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id),
+  INDEX idx_user_id (user_id)
 );
 
 -- Create products table
 CREATE TABLE IF NOT EXISTS products (
   id INT PRIMARY KEY AUTO_INCREMENT,
+  seller_id INT NOT NULL,
   name VARCHAR(255) NOT NULL,
   description TEXT,
   price DECIMAL(10, 2) NOT NULL,
   sku VARCHAR(100) UNIQUE NOT NULL,
   category VARCHAR(100),
+  image_url VARCHAR(500),
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (seller_id) REFERENCES users(id),
   INDEX idx_sku (sku),
-  INDEX idx_category (category)
+  INDEX idx_category (category),
+  INDEX idx_seller_id (seller_id)
 );
 
 -- Create orders table

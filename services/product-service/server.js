@@ -1,6 +1,7 @@
 const express = require('express');
 const { MongoClient } = require('mongodb');
 const redis = require('redis');
+const { Client } = require('@elastic/elasticsearch');
 const cors = require('cors');
 require('dotenv').config();
 
@@ -11,8 +12,9 @@ app.use(cors());
 let mongoClient;
 let productsCollection;
 let redisClient;
+let esClient;
 
-// Initialize MongoDB and Redis
+// Initialize MongoDB, Redis, and Elasticsearch
 async function initialize() {
   try {
     // MongoDB connection
@@ -29,6 +31,29 @@ async function initialize() {
     redisClient.on('error', (err) => console.error('Redis error:', err));
     await redisClient.connect();
     console.log('✓ Redis connected');
+
+    // Elasticsearch connection
+    esClient = new Client({ node: process.env.ELASTICSEARCH_URL || 'http://localhost:9200' });
+    await esClient.ping();
+    console.log('✓ Elasticsearch connected');
+
+    // Create index if not exists (with autocomplete suggest field)
+    await esClient.indices.create({
+      index: 'products',
+      body: {
+        mappings: {
+          properties: {
+            name: { type: 'text', analyzer: 'standard' },
+            name_suggest: { type: 'completion' },
+            description: { type: 'text', analyzer: 'standard' },
+            category: { type: 'keyword' },
+            price: { type: 'float' },
+            sku: { type: 'keyword' },
+            created_at: { type: 'date' }
+          }
+        }
+      }
+    }, { ignore: [400] }); // Ignore if index already exists
   } catch (err) {
     console.error('Connection error:', err.message);
     setTimeout(initialize, 5000);
@@ -60,6 +85,15 @@ app.post('/', async (req, res) => {
     };
 
     const result = await productsCollection.insertOne(product);
+
+    // Index in Elasticsearch with autocomplete suggest field
+    // Exclude _id from the body (ES uses it as metadata via the `id` param)
+    const { _id, ...productDoc } = product;
+    await esClient.index({
+      index: 'products',
+      id: result.insertedId.toString(),
+      body: { ...productDoc, name_suggest: { input: [name, ...(category ? [category] : [])] } }
+    });
 
     res.status(201).json({ id: result.insertedId, ...product });
   } catch (err) {
@@ -103,6 +137,118 @@ app.get('/', async (req, res) => {
     res.json(response);
   } catch (err) {
     console.error('Get products error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Search products
+app.get('/search', async (req, res) => {
+  try {
+    const query = req.query.q || '';
+    const category = req.query.category;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const from = (page - 1) * limit;
+
+    const cacheKey = `search:q:${query}:category:${category}:page:${page}:limit:${limit}`;
+    const cached = await redisClient.get(cacheKey);
+
+    if (cached) {
+      return res.json(JSON.parse(cached));
+    }
+
+    let searchQuery = {
+      bool: {
+        must: [],
+        filter: []
+      }
+    };
+
+    if (query) {
+      searchQuery.bool.must.push({
+        multi_match: {
+          query: query,
+          fields: ['name^2', 'description', 'sku']
+        }
+      });
+    }
+
+    if (category) {
+      searchQuery.bool.filter.push({
+        term: { category: category }
+      });
+    }
+
+    const result = await esClient.search({
+      index: 'products',
+      body: {
+        query: searchQuery,
+        from: from,
+        size: limit,
+        sort: [{ _score: 'desc' }, { created_at: 'desc' }]
+      }
+    });
+
+    const products = result.hits.hits.map(hit => ({
+      id: hit._id,
+      ...hit._source,
+      score: hit._score
+    }));
+
+    const response = {
+      products,
+      pagination: {
+        page,
+        limit,
+        total: result.hits.total.value,
+        pages: Math.ceil(result.hits.total.value / limit)
+      }
+    };
+
+    await redisClient.setEx(cacheKey, 1800, JSON.stringify(response)); // 30 min cache
+
+    res.json(response);
+  } catch (err) {
+    console.error('Search products error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Autocomplete product names (Elasticsearch completion suggester)
+// IMPORTANT: must be declared before /:id to avoid being swallowed by the wildcard
+app.get('/autocomplete', async (req, res) => {
+  try {
+    const prefix = req.query.q || '';
+    if (!prefix) return res.json({ suggestions: [] });
+
+    const cacheKey = `autocomplete:${prefix}`;
+    const cached = await redisClient.get(cacheKey);
+    if (cached) return res.json(JSON.parse(cached));
+
+    const result = await esClient.search({
+      index: 'products',
+      body: {
+        suggest: {
+          product_suggest: {
+            prefix,
+            completion: { field: 'name_suggest', size: 10, skip_duplicates: true }
+          }
+        }
+      }
+    });
+
+    const suggestions = (result.suggest?.product_suggest?.[0]?.options || []).map(opt => ({
+      text: opt.text,
+      id: opt._id,
+      score: opt._score
+    }));
+
+    const response = { suggestions };
+    await redisClient.setEx(cacheKey, 60, JSON.stringify(response)); // 1 min cache
+
+    res.json(response);
+  } catch (err) {
+    console.error('Autocomplete error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # Databases
   mysql:
@@ -7,11 +5,14 @@ services:
     environment:
       MYSQL_ROOT_PASSWORD: root_password
       MYSQL_DATABASE: ecommerce_db
+      MYSQL_USER: debezium
+      MYSQL_PASSWORD: debezium_password
     ports:
       - "3306:3306"
     volumes:
       - mysql_data:/var/lib/mysql
       - ./docker/mysql-init.sql:/docker-entrypoint-initdb.d/init.sql
+    command: --server-id=1 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL --expire_logs_days=10
     networks:
       - ecommerce
 
@@ -36,6 +37,82 @@ services:
     networks:
       - ecommerce
 
+  # Apache Kafka
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - ecommerce
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks:
+      - ecommerce
+
+  # Elasticsearch
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.5.0
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - ecommerce
+
+  # MinIO (S3 compatible storage)
+  minio:
+    image: minio/minio
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    networks:
+      - ecommerce
+
+  # MinIO bucket init
+  minio-init:
+    image: minio/mc
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      mc alias set local http://minio:9000 minioadmin minioadmin;
+      mc mb --ignore-existing local/ecommerce-data;
+      mc mb --ignore-existing local/spark-checkpoints;
+      echo 'MinIO buckets created';
+      "
+    networks:
+      - ecommerce
+
   # Nginx API Gateway
   api-gateway:
     build:
@@ -57,6 +134,21 @@ services:
       - ORDER_SERVICE_URL=http://order-service:3003
       - INVENTORY_SERVICE_URL=http://inventory-service:3004
       - PAYMENT_SERVICE_URL=http://payment-service:3005
+      - NOTIFICATION_SERVICE_URL=http://notification-service:3006
+      - ANALYTICS_SERVICE_URL=http://analytics-service:3007
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api-gateway
+    networks:
+      - ecommerce
+    environment:
+      - REACT_APP_API_URL=http://localhost
 
   # Microservices
   user-service:
@@ -89,9 +181,11 @@ services:
       - NODE_ENV=development
       - MONGO_URL=mongodb://mongodb:27017/ecommerce_catalog
       - REDIS_URL=redis://redis:6379
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
     depends_on:
       - mongodb
       - redis
+      - elasticsearch
     networks:
       - ecommerce
 
@@ -108,8 +202,10 @@ services:
       - DB_USER=root
       - DB_PASSWORD=root_password
       - DB_NAME=ecommerce_db
+      - KAFKA_BROKERS=kafka:29092
     depends_on:
       - mysql
+      - kafka
     networks:
       - ecommerce
 
@@ -126,8 +222,10 @@ services:
       - DB_USER=root
       - DB_PASSWORD=root_password
       - DB_NAME=ecommerce_db
+      - KAFKA_BROKERS=kafka:29092
     depends_on:
       - mysql
+      - kafka
     networks:
       - ecommerce
 
@@ -145,8 +243,100 @@ services:
       - DB_PASSWORD=root_password
       - DB_NAME=ecommerce_db
       - STRIPE_API_KEY=sk_test_placeholder
+      - KAFKA_BROKERS=kafka:29092
     depends_on:
       - mysql
+      - kafka
+    networks:
+      - ecommerce
+
+  notification-service:
+    build:
+      context: ./services/notification-service
+      dockerfile: Dockerfile
+    ports:
+      - "3006:3006"
+    environment:
+      - PORT=3006
+      - NODE_ENV=development
+      - KAFKA_BROKERS=kafka:29092
+    depends_on:
+      - kafka
+    networks:
+      - ecommerce
+
+  analytics-service:
+    build:
+      context: ./services/analytics-service
+      dockerfile: Dockerfile
+    ports:
+      - "3007:3007"
+    environment:
+      - PORT=3007
+      - NODE_ENV=development
+      - KAFKA_BROKERS=kafka:29092
+      - REDIS_URL=redis://redis:6379
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+    depends_on:
+      - kafka
+      - redis
+      - elasticsearch
+    networks:
+      - ecommerce
+
+  # Debezium CDC connector (MySQL → Kafka)
+  debezium:
+    image: debezium/connect:2.1
+    ports:
+      - "8083:8083"
+    environment:
+      - BOOTSTRAP_SERVERS=kafka:29092
+      - GROUP_ID=debezium-group
+      - CONFIG_STORAGE_TOPIC=debezium_connect_configs
+      - OFFSET_STORAGE_TOPIC=debezium_connect_offsets
+      - STATUS_STORAGE_TOPIC=debezium_connect_statuses
+      - KEY_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - VALUE_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - KEY_CONVERTER_SCHEMAS_ENABLE=false
+      - VALUE_CONVERTER_SCHEMAS_ENABLE=false
+    depends_on:
+      - kafka
+      - mysql
+    networks:
+      - ecommerce
+
+  # Apache Spark - Streaming Analytics (run manually with: docker compose -f docker-compose.local.yml --profile spark up)
+  spark-master:
+    image: bitnami/spark:3.5
+    profiles: ["spark"]
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    ports:
+      - "7077:7077"
+      - "8080:8080"
+    volumes:
+      - ./spark-apps:/opt/spark-apps
+    networks:
+      - ecommerce
+
+  spark-worker:
+    image: bitnami/spark:3.5
+    profiles: ["spark"]
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=1G
+      - SPARK_WORKER_CORES=2
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+    depends_on:
+      - spark-master
+    volumes:
+      - ./spark-apps:/opt/spark-apps
     networks:
       - ecommerce
 
@@ -154,6 +344,8 @@ volumes:
   mysql_data:
   mongo_data:
   redis_data:
+  elasticsearch_data:
+  minio_data:
 
 networks:
   ecommerce:
